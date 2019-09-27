@@ -10,23 +10,33 @@
 #include <time.h>
 #include <unistd.h>
 
+// Constant definition, TODO: put in separate config file
 #define MAX_INPUT_LENGTH 100
 #define MAX_NUM_RESULTS 100
 #define MAX_RESULT_LENGTH 1000
 #define MAX_PATH_DEPTH 10
 #define BASE_PATH "/home/clados"
 #define DELIMITER '/'
+#define INCLUDE_HIDDEN 0
+#define OPEN_PDF "mupdf"
+#define EXIT_KEY ' '
+
+pthread_mutex_t input_lock;
+pthread_mutex_t suggestion_lock;
 /*
  *------------------I/O related stuff------------------
  */
 
 typedef enum { ERROR_INPUT_TOO_LONG } Errors;
 typedef enum { RESULT_FOUND, RESULT_NOT_FOUND } Result;
+typedef enum { TYPE_PDF, TYPE_TEXT, TYPE_NONE } FileType;
 
 typedef struct {
   char *input_buffer;
   char **result_buffer;
-
+  char *current_suggestion;
+  int new_input;
+  int new_suggestions;
 } thread_args;
 
 char **create_result_buffer() {
@@ -38,13 +48,12 @@ char **create_result_buffer() {
   return b;
 }
 
-void delete_result_buffer(char** b){
-  for (int i=0;i<MAX_NUM_RESULTS;i++){
+void delete_result_buffer(char **b) {
+  for (int i = 0; i < MAX_NUM_RESULTS; i++) {
     free(b[i]);
   }
   free(b);
 }
-
 
 void clear_result_buffer(char **b) {
   for (int i = 0; i < MAX_NUM_RESULTS; i++) {
@@ -75,14 +84,16 @@ int search_fs(char ***list, char *file_name, char *directory, int *location) {
       return 0;
     }
     if (!strcmp(directory_structure->d_name, "..") ||
-        !strcmp(directory_structure->d_name, "."))
+        !strcmp(directory_structure->d_name, ".") ||
+        (!strncmp(directory_structure->d_name, ".", 1) && !INCLUDE_HIDDEN))
       continue;
-
+    // found a file with correct name
     else if (!strcmp(directory_structure->d_name, file_name)) {
       (*list)[*location] = (char *)malloc(sizeof(char) * MAX_RESULT_LENGTH);
       sprintf((*list)[*location], "%s%s", directory,
               directory_structure->d_name);
       (*location)++;
+      // found a subir -> explore it!
     } else if (directory_structure->d_type == DT_DIR) {
       sprintf(temp_dir, "%s%s", directory, directory_structure->d_name);
       if (search_fs(list, file_name, temp_dir, location) == -1) {
@@ -97,7 +108,7 @@ int search_fs(char ***list, char *file_name, char *directory, int *location) {
 }
 
 int find_file(char *input_buffer, char **result_buffer) {
-  char ** found_list = (char**)malloc(sizeof(char*) * MAX_NUM_RESULTS);
+  char **found_list = (char **)malloc(sizeof(char *) * MAX_NUM_RESULTS);
   if (!found_list) {
     printf("could not get result list\n");
     return 0;
@@ -119,7 +130,7 @@ int find_file(char *input_buffer, char **result_buffer) {
       free(found_list[location_counter]);
     }
   } else {
-    //printf("Failed to find the file!\n");
+    // printf("Failed to find the file!\n");
   }
 
   free(ini_dir);
@@ -128,9 +139,8 @@ int find_file(char *input_buffer, char **result_buffer) {
   return 1;
 }
 
-
 // Estimate the "value" of a possible search result
-// to provide better suggestions
+// to provide better suggestions, currently just path length
 double get_suggestion_value(char *suggestion) {
   // Get path depth, TODO: is there a function for this ?
   double depth = 0;
@@ -143,7 +153,7 @@ double get_suggestion_value(char *suggestion) {
     }
     i += 1;
   }
-  depth /= MAX_PATH_DEPTH;
+  depth = 1 / (depth / MAX_PATH_DEPTH);
   return depth;
 }
 
@@ -168,33 +178,62 @@ char *get_best_suggestion(char **result_buffer) {
   return result_buffer[best_suggestion];
 }
 
+FileType get_file_type(char *file) {
+  int last_index = -1;
+  char extension[10];
+  for (int i = strlen(file) - 1; i >= 0; i--) {
+    if (file[i] == '.') {
+      last_index = i;
+    }
+  }
+  if (last_index == -1) {
+    return TYPE_NONE;
+  } else {
+    memcpy(extension, &file[last_index], strlen(file) - last_index);
+  }
+  if (strcmp(extension, ".pdf") == 0) {
+    return TYPE_PDF;
+  } else if (strcmp(extension, ".txt") == 0) {
+    return TYPE_TEXT;
+  } else {
+    return TYPE_NONE;
+  }
+}
 
-void open_file(char location[], char filename[], char filetype[]) {
-  char full_path[80];
+int open_file(char *file) {
   char command[100];
-  strcpy(full_path, location);
-  strcat(full_path, filename);
-  strcat(full_path, ".");
-  strcat(full_path, filetype);
-  strcpy(command, "mupdf ");
-  strcat(command, full_path);
+  FileType type = get_file_type(file);
+  switch (type) {
+  case TYPE_PDF:
+    strcpy(command, "mupdf ");
+    break;
+  case TYPE_TEXT:
+    strcpy(command, "st nvim ");
+    break;
+  case TYPE_NONE:
+    // For now we try to open everythin without a file extension as a directory
+    strcpy(command, "st fff ");
+  }
+  strcat(command, file);
+  // Release command to continue
+  strcat(command, " &");
   system(command);
+  return 1;
 }
 
 void search_loop(void *t) {
-  char *last_buffer = malloc(sizeof(char) * MAX_INPUT_LENGTH);
   thread_args *t_a = (thread_args *)t;
   while (true) {
-    // First iteration
-    if (last_buffer[0] == '\0' && t_a->input_buffer[0] != '\0') {
-      strcpy(last_buffer, t_a->input_buffer);
-      int r = find_file(t_a->input_buffer, t_a->result_buffer);
-      // New search term
-    } else if (strcmp(last_buffer, t_a->input_buffer) != 0) {
+    // Only search if we have a new input
+    if (t_a->new_input) {
+      pthread_mutex_lock(&input_lock);
+      t_a->new_input = 0;
+      pthread_mutex_unlock(&input_lock);
       clear_result_buffer(t_a->result_buffer);
-      last_buffer[0] = '\0';
-      strcpy(last_buffer, t_a->input_buffer);
-      int r = find_file(t_a->input_buffer, t_a->result_buffer);
+      find_file(t_a->input_buffer, t_a->result_buffer);
+      pthread_mutex_lock(&suggestion_lock);
+      t_a->new_suggestions = 1;
+      pthread_mutex_unlock(&suggestion_lock);
     }
   }
 }
@@ -207,35 +246,57 @@ void input_loop(void *t) {
     system("/bin/stty raw");
     c = getchar();
     system("/bin/stty cooked");
-    if (c == ' ') {
+
+    if (c == EXIT_KEY) {
       return;
+    }
+    if (c == 9 || c == 13) { // Tab/Enter
+      if (strlen(t_a->current_suggestion) > 0) {
+        if (open_file(t_a->current_suggestion)) {
+          // Opened successfull
+          return;
+        }
+      }
+    } else if (c == 127) { // backspace
+      if (i > 0) {
+        t_a->input_buffer[i - 1] = '\0';
+        i -= 1;
+      }
+    } else if ((c >= 97 && c <= 122) || c == 46 || c == 95 ||
+               (c >= 68 && c <= 90) || (c >= 48 && c <= 57)) { // normal char
+      t_a->input_buffer[i] = c;
+      i += 1;
+      // TODO: also consider special chars and uppercases
     }
     // check if input is not to long
     if (i == MAX_INPUT_LENGTH) {
       return;
     }
-    // Get the latest added char and add to buffer
-    t_a->input_buffer[i] = c;
-    i += 1;
+
+    // Notify search thread to re-calculate search
+    pthread_mutex_lock(&input_lock);
+    t_a->new_input = 1;
+    pthread_mutex_unlock(&input_lock);
   }
 }
 
 void gui_loop(void *t) {
   thread_args *t_a = (thread_args *)t;
-  char final_result[MAX_RESULT_LENGTH];
   double val = 0;
   while (true) {
-    if (t_a->result_buffer[0][0] != '\0') {
-      strcpy(final_result, get_best_suggestion(t_a->result_buffer));
-      val = get_suggestion_value(t_a->result_buffer[0]);
-    } else {
-      strcpy(final_result, "No current suggestions");
+    // Only update best suggestion if new suggestions available
+    if (t_a->new_suggestions) {
+      pthread_mutex_lock(&suggestion_lock);
+      t_a->new_suggestions = 0;
+      pthread_mutex_unlock(&suggestion_lock);
+      t_a->current_suggestion = get_best_suggestion(t_a->result_buffer);
+      val = get_suggestion_value(t_a->current_suggestion);
     }
-    printf("\r \033[1;36m> \033[0m%s \033[0;33m%s - %f\033[0m",
-           t_a->input_buffer, t_a->result_buffer[0], val);
+    printf("\33[2K\r \033[1;36m> \033[0m%s \033[0;33m%s\033[0m",
+           t_a->input_buffer, t_a->current_suggestion);
     fflush(stdout);
     // Wait for 100ms so the cursor doesnt go crazy
-    usleep(100);
+    usleep(50);
   }
 }
 
@@ -244,7 +305,19 @@ int main(int argc, char *argv[]) {
 
   thread_args *t_a = malloc(sizeof(thread_args));
   t_a->input_buffer = malloc(sizeof(char) * MAX_INPUT_LENGTH);
+  t_a->current_suggestion = malloc(sizeof(char) * MAX_RESULT_LENGTH);
   t_a->result_buffer = create_result_buffer();
+  t_a->new_input = 0;
+  t_a->new_suggestions = 0;
+
+  if (pthread_mutex_init(&input_lock, NULL) != 0) {
+    printf("\n mutex init failed\n");
+    return 1;
+  }
+  if (pthread_mutex_init(&suggestion_lock, NULL) != 0) {
+    printf("\n mutex init failed\n");
+    return 1;
+  }
 
   pthread_t t_id_search, t_id_input, t_id_gui;
   pthread_create(&t_id_search, NULL, search_loop, (void *)t_a);
