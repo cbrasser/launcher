@@ -14,7 +14,8 @@
 #define MAX_INPUT_LENGTH 100
 #define MAX_NUM_RESULTS 100
 #define MAX_RESULT_LENGTH 1000
-#define MAX_PATH_DEPTH 10
+#define MAX_PATH_DEPTH 1000
+#define MAX_NUM_SUBDIRS 1000
 #define BASE_PATH "/home/clados"
 #define DELIMITER '/'
 #define INCLUDE_HIDDEN 0
@@ -37,6 +38,7 @@ typedef struct {
   char *current_suggestion;
   int new_input;
   int new_suggestions;
+  int suggestion_index;
 } thread_args;
 
 char **create_result_buffer() {
@@ -61,48 +63,65 @@ void clear_result_buffer(char **b) {
   }
 }
 
-int search_fs(char ***list, char *file_name, char *directory, int *location) {
+int search_fs(char ***dir_list, char ***list, char *file_name, char *directory,
+              int *location, int *dir_location) {
   DIR *opened_dir;
   struct dirent *directory_structure;
 
-  // printf("searching for '%s' in '%s'\n",file_name, directory);
-  char *temp_dir = (char *)malloc(sizeof(char) * MAX_RESULT_LENGTH);
-  if (!temp_dir)
-    return -1;
-  strcat(directory, "/");
+  // printf("Entered search in dir: %s\n", directory);
   opened_dir = opendir(directory);
   if (opened_dir == NULL) {
     printf("could not open dir: %s\n", directory);
-    free(temp_dir);
     return -1;
   }
+  int sub_dir_count = 0;
+  strcat(directory, "/");
+
+  // While we get stuff from the readdir stream
   while (1) {
+    // We want to simulate a BFS: We want to check the files in the current
+    // folder first, and then go into the subfolders!
     directory_structure = readdir(opened_dir);
+    // Stream is done -> continue onto handling diretories
     if (!directory_structure) {
       closedir(opened_dir);
-      free(temp_dir);
-      return 0;
+      break;
     }
-    if (!strcmp(directory_structure->d_name, "..") ||
-        !strcmp(directory_structure->d_name, ".") ||
-        (!strncmp(directory_structure->d_name, ".", 1) && !INCLUDE_HIDDEN))
+    // Current item from stream is dir, push it onto stack if its not hidden,
+    // back or current
+    if (directory_structure->d_type == DT_DIR) {
+      if (!strcmp(directory_structure->d_name, "..") ||
+          !strcmp(directory_structure->d_name, ".") ||
+          (!strncmp(directory_structure->d_name, ".", 1) && !INCLUDE_HIDDEN))
+        continue;
+      // printf("Pushing dir %s onto stack\n", directory_structure->d_name);
+      (*dir_list)[*dir_location] =
+          (char *)malloc(sizeof(char) * MAX_PATH_DEPTH);
+      sprintf((*dir_list)[*dir_location], "%s%s", directory,
+              directory_structure->d_name);
+      (*dir_location)++;
+      sub_dir_count++;
       continue;
-    // found a file with correct name
-    else if (!strcmp(directory_structure->d_name, file_name)) {
+    }
+
+    // found a file with correct name, append it to list of found files
+    if (!strcmp(directory_structure->d_name, file_name)) {
+      // Append file/dir to list and go on
       (*list)[*location] = (char *)malloc(sizeof(char) * MAX_RESULT_LENGTH);
       sprintf((*list)[*location], "%s%s", directory,
               directory_structure->d_name);
       (*location)++;
-      // found a subir -> explore it!
-    } else if (directory_structure->d_type == DT_DIR) {
-      sprintf(temp_dir, "%s%s", directory, directory_structure->d_name);
-      if (search_fs(list, file_name, temp_dir, location) == -1) {
-        closedir(opened_dir);
-        free(temp_dir);
-        return -1;
-      }
     }
   }
+  // free(directory_structure);
+
+    int initial_dir_location = *dir_location;
+    while (*dir_location > initial_dir_location - sub_dir_count) {
+      search_fs(dir_list, list, file_name, (*dir_list)[(*dir_location)-1],
+                location, dir_location);
+      (*dir_location)--;
+      free((*dir_list)[*dir_location]);
+    }
 
   return 0;
 }
@@ -113,17 +132,23 @@ int find_file(char *input_buffer, char **result_buffer) {
     printf("could not get result list\n");
     return 0;
   }
-
+  char **dir_list = (char **)malloc(sizeof(char *) * MAX_NUM_SUBDIRS);
+  if (!dir_list) {
+    free(found_list);
+    return 0;
+  }
   int location_counter = 0;
-
+  int dir_location_counter = 0;
   char *ini_dir = (char *)malloc(sizeof(char) * 500);
   if (!ini_dir) {
     free(found_list);
+    free(dir_list);
     return 0;
   }
 
   strcpy(ini_dir, BASE_PATH);
-  search_fs(&found_list, input_buffer, ini_dir, &location_counter);
+  search_fs(&dir_list, &found_list, input_buffer, ini_dir, &location_counter,
+            &dir_location_counter);
   if (location_counter > 0) {
     while (--location_counter >= 0) {
       strcpy(result_buffer[location_counter], found_list[location_counter]);
@@ -135,6 +160,7 @@ int find_file(char *input_buffer, char **result_buffer) {
 
   free(ini_dir);
   free(found_list);
+  free(dir_list);
 
   return 1;
 }
@@ -309,6 +335,7 @@ int main(int argc, char *argv[]) {
   t_a->result_buffer = create_result_buffer();
   t_a->new_input = 0;
   t_a->new_suggestions = 0;
+  t_a->suggestion_index = 0;
 
   if (pthread_mutex_init(&input_lock, NULL) != 0) {
     printf("\n mutex init failed\n");
