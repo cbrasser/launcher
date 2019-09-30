@@ -12,9 +12,9 @@
 
 // Constant definition, TODO: put in separate config file
 #define MAX_INPUT_LENGTH 100
-#define MAX_NUM_RESULTS 100
+#define MAX_NUM_RESULTS 100000
 #define MAX_RESULT_LENGTH 1000
-#define MAX_PATH_DEPTH 1000
+#define MAX_PATH_DEPTH 3
 #define MAX_NUM_SUBDIRS 1000
 #define BASE_PATH "/home/clados"
 #define DELIMITER '/'
@@ -64,14 +64,13 @@ void clear_result_buffer(char **b) {
 }
 
 int search_fs(char ***dir_list, char ***list, char *file_name, char *directory,
-              int *location, int *dir_location) {
+              int *location, int *dir_location, int depth) {
   DIR *opened_dir;
   struct dirent *directory_structure;
 
-  // printf("Entered search in dir: %s\n", directory);
   opened_dir = opendir(directory);
   if (opened_dir == NULL) {
-    printf("could not open dir: %s\n", directory);
+    // printf("could not open dir: %s\n", directory);
     return -1;
   }
   int sub_dir_count = 0;
@@ -87,16 +86,16 @@ int search_fs(char ***dir_list, char ***list, char *file_name, char *directory,
       closedir(opened_dir);
       break;
     }
+
     // Current item from stream is dir, push it onto stack if its not hidden,
     // back or current
-    if (directory_structure->d_type == DT_DIR) {
+    if (directory_structure->d_type == DT_DIR && depth < MAX_PATH_DEPTH) {
       if (!strcmp(directory_structure->d_name, "..") ||
           !strcmp(directory_structure->d_name, ".") ||
           (!strncmp(directory_structure->d_name, ".", 1) && !INCLUDE_HIDDEN))
         continue;
-      // printf("Pushing dir %s onto stack\n", directory_structure->d_name);
       (*dir_list)[*dir_location] =
-          (char *)malloc(sizeof(char) * MAX_PATH_DEPTH);
+          (char *)malloc(sizeof(char) * MAX_RESULT_LENGTH);
       sprintf((*dir_list)[*dir_location], "%s%s", directory,
               directory_structure->d_name);
       (*dir_location)++;
@@ -105,7 +104,8 @@ int search_fs(char ***dir_list, char ***list, char *file_name, char *directory,
     }
 
     // found a file with correct name, append it to list of found files
-    if (!strcmp(directory_structure->d_name, file_name)) {
+     else if (!strncmp(directory_structure->d_name, file_name, strlen(file_name)) && directory_structure->d_type == DT_REG && *location < MAX_NUM_RESULTS) {
+       // printf("found partial match: %s\n", directory_structure->d_name);
       // Append file/dir to list and go on
       (*list)[*location] = (char *)malloc(sizeof(char) * MAX_RESULT_LENGTH);
       sprintf((*list)[*location], "%s%s", directory,
@@ -113,12 +113,11 @@ int search_fs(char ***dir_list, char ***list, char *file_name, char *directory,
       (*location)++;
     }
   }
-  // free(directory_structure);
 
     int initial_dir_location = *dir_location;
     while (*dir_location > initial_dir_location - sub_dir_count) {
       search_fs(dir_list, list, file_name, (*dir_list)[(*dir_location)-1],
-                location, dir_location);
+                location, dir_location, depth+1);
       (*dir_location)--;
       free((*dir_list)[*dir_location]);
     }
@@ -148,7 +147,7 @@ int find_file(char *input_buffer, char **result_buffer) {
 
   strcpy(ini_dir, BASE_PATH);
   search_fs(&dir_list, &found_list, input_buffer, ini_dir, &location_counter,
-            &dir_location_counter);
+            &dir_location_counter, 0);
   if (location_counter > 0) {
     while (--location_counter >= 0) {
       strcpy(result_buffer[location_counter], found_list[location_counter]);
